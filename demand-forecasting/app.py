@@ -1,91 +1,145 @@
 import pandas as pd
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from chronos import BaseChronosPipeline
-from typing import Optional
+from typing import Optional, List
 
-app = FastAPI()
+app = FastAPI(
+    title="Fashion Inventory Planner",
+    description="Chronos-based demand forecasting for shirts and jeans",
+    version="1.0.0",
+)
 
-# Load data and calculate units
+# -----------------------------
+# Load data and build time series
+# -----------------------------
+
 df = pd.read_csv("data/Fashion_Retail_Sales.csv")
 df["Date Purchase"] = pd.to_datetime(df["Date Purchase"])
 
-# Estimate units: assume average item price across all transactions
-avg_price_per_unit = df["Purchase Amount (USD)"].mean()
-print(f"Using avg price per unit: ${avg_price_per_unit:.2f}")
-
-# Convert USD to estimated units per day
-df["Estimated Units"] = df["Purchase Amount (USD)"] / avg_price_per_unit
+# Daily total units across all items
 daily_units = (
-    df.groupby("Date Purchase")["Estimated Units"]
+    df.groupby("Date Purchase")["Purchased Quantity"]
       .sum()
       .sort_index()
 )
 
-print("Daily units head:")
-print(daily_units.head())
+# Daily units per item (e.g. "shirt", "jeans")
+item_series: dict[str, pd.Series] = {}
+for item_name, g in df.groupby("Item Purchased"):
+    s = (
+        g.groupby("Date Purchase")["Purchased Quantity"]
+         .sum()
+         .sort_index()
+    )
+    item_series[item_name] = s
 
-# Load model (forecast on units now)
-pipeline = BaseChronosPipeline.from_pretrained("amazon/chronos-t5-small", device_map="cpu", dtype=torch.bfloat16)
+# -----------------------------
+# Load Chronos model
+# -----------------------------
+
+pipeline = BaseChronosPipeline.from_pretrained(
+    "amazon/chronos-t5-small",
+    device_map="cpu",
+    dtype=torch.bfloat16,
+)
+
+# -----------------------------
+# Updated Pydantic models (cleaner structure)
+# -----------------------------
 
 class InventoryRequest(BaseModel):
     lead_time_days: int = 7
-    current_inventory_units: int = 0      # <-- Now in UNITS
+    current_inventory_units: int = 0
     safety_factor: float = 1.2
+    item: Optional[str] = None  # "shirt", "jeans", or None for all
 
-class InventoryRecommendation(BaseModel):
+class DailyForecast(BaseModel):
     date: str
     forecast_units: int
-    reorder_point_units: int
-    suggested_order_units: int
     risk_of_stockout: str
 
 class InventoryResponse(BaseModel):
     item: str
-    avg_price_per_unit: float
     lead_time_days: int
-    recommendations: list[InventoryRecommendation]
+    reorder_point_units: int              # ← Fixed at top level
+    suggested_order_units: int            # ← Fixed at top level
+    recommendations: List[DailyForecast]  # ← Daily forecasts only
+
+# -----------------------------
+# Updated API endpoint
+# -----------------------------
 
 @app.post("/inventory-plan", response_model=InventoryResponse)
 def inventory_plan(req: InventoryRequest):
-    context = torch.tensor(daily_units.values, dtype=torch.float32)
-    
-    # Forecast UNITS (not dollars)
+    # Choose which time series to forecast
+    if req.item:
+        if req.item not in item_series:
+            raise HTTPException(status_code=400, detail=f"Unknown item: {req.item}")
+        series = item_series[req.item]
+        item_name = req.item
+    else:
+        series = daily_units
+        item_name = "All Items"
+
+    if len(series) < 3:
+        raise HTTPException(status_code=400, detail="Not enough history to forecast")
+
+    # Chronos expects a tensor context of the time series
+    context = torch.tensor(series.values, dtype=torch.float32)
+
     quantiles, _ = pipeline.predict_quantiles(
-        context, 
-        prediction_length=req.lead_time_days, 
-        quantile_levels=[0.1, 0.5, 0.9]
+        context,
+        prediction_length=req.lead_time_days,
+        quantile_levels=[0.1, 0.5, 0.9],
     )
-    
-    median_forecast_units = quantiles[0, :, 1].numpy()     # P50 units
-    high_forecast_units = quantiles[0, :, 2].numpy()       # P90 units
-    
-    # Lead time total demand in UNITS
-    lead_time_median_demand = median_forecast_units.sum()
-    lead_time_safety_demand = (high_forecast_units.sum() - lead_time_median_demand) * req.safety_factor
-    
-    reorder_point_units = int(lead_time_median_demand + lead_time_safety_demand)
+
+    median_forecast_units = quantiles[0, :, 1].numpy()  # P50
+    high_forecast_units = quantiles[0, :, 2].numpy()    # P90
+
+    # FIXED totals for entire lead time (calculated once)
+    lead_time_median_demand = float(median_forecast_units.sum())
+    lead_time_safety_demand = float(
+        (high_forecast_units.sum() - lead_time_median_demand) * req.safety_factor
+    )
+
+    reorder_point_units = int(round(lead_time_median_demand + lead_time_safety_demand))
     suggested_order_units = max(0, reorder_point_units - req.current_inventory_units)
-    
-    last_date = daily_units.index[-1]
-    future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=req.lead_time_days, freq="D")
-    
-    points = []
-    for i, (date, med_units, high_units) in enumerate(zip(future_dates, median_forecast_units, high_forecast_units)):
-        days_to_stockout = req.current_inventory_units / med_units if med_units > 0 else 999
-        stockout_risk = "HIGH" if days_to_stockout < req.lead_time_days * 0.8 else "MEDIUM" if days_to_stockout < req.lead_time_days else "LOW"
-        points.append(InventoryRecommendation(
-            date=str(date.date()),
-            forecast_units=int(round(med_units)),
-            reorder_point_units=reorder_point_units,
-            suggested_order_units=suggested_order_units,
-            risk_of_stockout=stockout_risk,
-        ))
-    
+
+    # Build daily recommendations (forecast + risk only)
+    last_date = series.index[-1]
+    future_dates = pd.date_range(
+        last_date + pd.Timedelta(days=1),
+        periods=req.lead_time_days,
+        freq="D",
+    )
+
+    recommendations: List[DailyForecast] = []
+    for date, med_units in zip(future_dates, median_forecast_units):
+        med_units = float(med_units)
+        days_to_stockout = (
+            req.current_inventory_units / med_units if med_units > 0 else 999.0
+        )
+        if days_to_stockout < req.lead_time_days * 0.8:
+            stockout_risk = "HIGH"
+        elif days_to_stockout < req.lead_time_days:
+            stockout_risk = "MEDIUM"
+        else:
+            stockout_risk = "LOW"
+
+        recommendations.append(
+            DailyForecast(
+                date=str(date.date()),
+                forecast_units=int(round(med_units)),
+                risk_of_stockout=stockout_risk,
+            )
+        )
+
     return InventoryResponse(
-        item="Brand Total",
-        avg_price_per_unit=float(avg_price_per_unit),
+        item=item_name,
         lead_time_days=req.lead_time_days,
-        recommendations=points,
+        reorder_point_units=reorder_point_units,
+        suggested_order_units=suggested_order_units,
+        recommendations=recommendations,
     )

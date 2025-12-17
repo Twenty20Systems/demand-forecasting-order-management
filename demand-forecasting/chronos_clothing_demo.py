@@ -1,56 +1,76 @@
 import pandas as pd
 import torch
-from chronos import BaseChronosPipeline   # <-- use BaseChronosPipeline
+from chronos import BaseChronosPipeline
 
-# 1) Load CSV
-df = pd.read_csv("data/Fashion_Retail_Sales.csv")
+CSV_PATH = "data/Fashion_Retail_Sales.csv"
+MODEL_NAME = "amazon/chronos-t5-small"
+PREDICTION_LENGTH = 7
 
-# 2) Parse date column
-df["Date Purchase"] = pd.to_datetime(df["Date Purchase"])
+def load_data():
+    df = pd.read_csv(CSV_PATH)
+    df["Date Purchase"] = pd.to_datetime(df["Date Purchase"])
+    return df
 
-# 3) Aggregate to daily total purchase amount (proxy for demand)
-daily = (
-    df.groupby("Date Purchase")["Purchase Amount (USD)"]
-      .sum()
-      .sort_index()
-)
+def build_series(df: pd.DataFrame):
+    # Total units per day
+    daily_total = (
+        df.groupby("Date Purchase")["Purchased Quantity"]
+          .sum()
+          .sort_index()
+    )
 
-print("Daily series head:")
-print(daily.head())
+    # Per-item units per day
+    per_item = {}
+    for item_name, g in df.groupby("Item Purchased"):
+        s = (
+            g.groupby("Date Purchase")["Purchased Quantity"]
+             .sum()
+             .sort_index()
+        )
+        per_item[item_name] = s
 
-# 4) Convert to tensor
-context = torch.tensor(daily.values, dtype=torch.float32)
+    return daily_total, per_item
 
-# 5) Load pre-trained Chronos model
-pipeline = BaseChronosPipeline.from_pretrained(
-    "amazon/chronos-t5-small",
-    device_map="cpu",
-    torch_dtype=torch.bfloat16,   # safe default; you can drop this if bfloat16 not supported
-)
+def load_pipeline():
+    pipeline = BaseChronosPipeline.from_pretrained(
+        MODEL_NAME,
+        device_map="cpu",
+        dtype=torch.bfloat16,
+    )
+    return pipeline
 
-# 6) Forecast next 14 days using quantiles API
-prediction_length = 14
-quantiles, mean = pipeline.predict_quantiles(
-    context,                       # positional, not context=...
-    prediction_length=prediction_length,
-    quantile_levels=[0.1, 0.5, 0.9],
-)
+def forecast_series(name: str, series: pd.Series, pipeline: BaseChronosPipeline):
+    print(f"\n=== Forecast for {name} ===")
+    print(f"History points: {len(series)}")
+    print(series.tail())
 
-# Take the median path (0.5 quantile)
-median_forecast = quantiles[0, :, 1]  # shape: (prediction_length,)
+    context = torch.tensor(series.values, dtype=torch.float32)
 
-# 7) Attach future dates
-last_date = daily.index[-1]
-future_dates = pd.date_range(
-    last_date + pd.Timedelta(days=1),
-    periods=prediction_length,
-    freq="D",
-)
+    quantiles, _ = pipeline.predict_quantiles(
+        context,
+        prediction_length=PREDICTION_LENGTH,
+        quantile_levels=[0.1, 0.5, 0.9],
+    )
 
-forecast_df = pd.DataFrame({
-    "date": future_dates,
-    "forecast_sales_usd": median_forecast.numpy(),
-})
+    low = quantiles[0, :, 0].numpy()
+    median = quantiles[0, :, 1].numpy()
+    high = quantiles[0, :, 2].numpy()
 
-print("\nForecast:")
-print(forecast_df)
+    print("\nNext", PREDICTION_LENGTH, "days forecast (units):")
+    for i, (l, m, h) in enumerate(zip(low, median, high), start=1):
+        print(f"Day +{i}: P10={l:.1f}, P50={m:.1f}, P90={h:.1f}")
+
+def main():
+    df = load_data()
+    daily_total, per_item = build_series(df)
+    pipeline = load_pipeline()
+
+    # Forecast for all items combined
+    forecast_series("All Items", daily_total, pipeline)
+
+    # Forecast per item
+    for item_name, s in per_item.items():
+        forecast_series(item_name, s, pipeline)
+
+if __name__ == "__main__":
+    main()
