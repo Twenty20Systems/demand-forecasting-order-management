@@ -153,6 +153,40 @@ def inventory_plan(req: InventoryRequest):
 
 @app.post("/", response_model=InventoryResponse)
 async def inventory_plan_root_proxy(request: Request):
-    body = await request.json()
-    req = InventoryRequest(**body)
+    raw_body = await request.body()
+    text = raw_body.decode("utf-8")
+    print("RAW BODY FROM GATEWAY:", raw_body)
+
+    # 1) First try: normal JSON (preferred, original behavior)
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError:
+        # 2) Fallback: handle current non‑JSON `key: value` format
+        data = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("{") or line.startswith("}"):
+                continue
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip().rstrip(",")
+
+            # Convert to correct Python types
+            if key in ("lead_time_days", "current_inventory_units"):
+                data[key] = int(value)
+            elif key == "safety_factor":
+                data[key] = float(value)
+            elif key == "item":
+                data[key] = value  # e.g. shirt, jeans
+
+        body = data
+
+    # Now `body` should match InventoryRequest
+    try:
+        req = InventoryRequest(**body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body does not match InventoryRequest schema")
+
     return inventory_plan(req)
