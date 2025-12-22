@@ -1,9 +1,10 @@
 import pandas as pd
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from chronos import BaseChronosPipeline
 from typing import Optional, List
+
 
 app = FastAPI(
     title="Fashion Inventory Planner",
@@ -46,7 +47,7 @@ pipeline = BaseChronosPipeline.from_pretrained(
 )
 
 # -----------------------------
-# Updated Pydantic models (cleaner structure)
+# Pydantic models
 # -----------------------------
 
 class InventoryRequest(BaseModel):
@@ -55,20 +56,22 @@ class InventoryRequest(BaseModel):
     safety_factor: float = 1.2
     item: Optional[str] = None  # "shirt", "jeans", or None for all
 
+
 class DailyForecast(BaseModel):
     date: str
     forecast_units: int
     risk_of_stockout: str
 
+
 class InventoryResponse(BaseModel):
     item: str
     lead_time_days: int
-    reorder_point_units: int              # ← Fixed at top level
-    suggested_order_units: int            # ← Fixed at top level
-    recommendations: List[DailyForecast]  # ← Daily forecasts only
+    reorder_point_units: int
+    suggested_order_units: int
+    recommendations: List[DailyForecast]
 
 # -----------------------------
-# Updated API endpoint
+# Main API endpoint
 # -----------------------------
 
 @app.post("/inventory-plan", response_model=InventoryResponse)
@@ -98,7 +101,7 @@ def inventory_plan(req: InventoryRequest):
     median_forecast_units = quantiles[0, :, 1].numpy()  # P50
     high_forecast_units = quantiles[0, :, 2].numpy()    # P90
 
-    # FIXED totals for entire lead time (calculated once)
+    # Totals over the lead time
     lead_time_median_demand = float(median_forecast_units.sum())
     lead_time_safety_demand = float(
         (high_forecast_units.sum() - lead_time_median_demand) * req.safety_factor
@@ -107,7 +110,7 @@ def inventory_plan(req: InventoryRequest):
     reorder_point_units = int(round(lead_time_median_demand + lead_time_safety_demand))
     suggested_order_units = max(0, reorder_point_units - req.current_inventory_units)
 
-    # Build daily recommendations (forecast + risk only)
+    # Build daily recommendations
     last_date = series.index[-1]
     future_dates = pd.date_range(
         last_date + pd.Timedelta(days=1),
@@ -143,3 +146,13 @@ def inventory_plan(req: InventoryRequest):
         suggested_order_units=suggested_order_units,
         recommendations=recommendations,
     )
+
+# -----------------------------
+# Root proxy for API Gateway
+# -----------------------------
+
+@app.post("/", response_model=InventoryResponse)
+async def inventory_plan_root_proxy(request: Request):
+    body = await request.json()
+    req = InventoryRequest(**body)
+    return inventory_plan(req)
