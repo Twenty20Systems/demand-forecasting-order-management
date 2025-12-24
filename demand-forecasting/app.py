@@ -156,13 +156,14 @@ def inventory_plan(req: InventoryRequest):
 async def inventory_plan_root_proxy(request: Request):
     raw_body = await request.body()
     text = raw_body.decode("utf-8")
-    print("RAW BODY FROM GATEWAY:", raw_body)
+    print("RAW BODY FROM GATEWAY:", text)  # ← DEBUG: see EXACT input
 
-    # 1) First try: normal JSON (preferred)
+    # 1) First try: normal JSON
     try:
         body = json.loads(text)
+        print("PARSED BODY:", body)  # ← DEBUG: see parsed input
     except json.JSONDecodeError:
-        # 2) Fallback: handle current non‑JSON `key: value` format
+        # 2) Fallback: handle non-JSON format
         data = {}
         for line in text.splitlines():
             line = line.strip()
@@ -174,7 +175,6 @@ async def inventory_plan_root_proxy(request: Request):
             key = key.strip()
             value = value.strip().rstrip(",")
 
-            # Convert to correct Python types
             if key in ("lead_time_days", "current_inventory_units"):
                 data[key] = int(value)
             elif key == "safety_factor":
@@ -184,14 +184,19 @@ async def inventory_plan_root_proxy(request: Request):
 
         body = data
 
-    # **NEW: Handle properties wrapper from Workato**
+    # **Handle properties wrapper**
     if "properties" in body:
+        print("FOUND PROPERTIES WRAPPER:", body["properties"])
         body = body["properties"]
+    
+    print("FINAL BODY FOR Pydantic:", body)  # ← DEBUG: final input
 
-    # Validate and process
+    # Validate
     try:
         req = InventoryRequest(**body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Request body does not match InventoryRequest schema")
+        print("SUCCESSFUL Pydantic parse:", req.dict())  # ← DEBUG: final req
+    except Exception as e:
+        print("PYDANTIC ERROR:", str(e))
+        raise HTTPException(status_code=400, detail=f"Request body does not match: {str(e)}")
 
     return inventory_plan(req)
