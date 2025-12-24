@@ -156,45 +156,31 @@ def inventory_plan(req: InventoryRequest):
 async def inventory_plan_root_proxy(request: Request):
     raw_body = await request.body()
     text = raw_body.decode("utf-8")
-    print("RAW BODY FROM GATEWAY:", text)  # ← DEBUG: see EXACT input
+    print("RAW BODY FROM GATEWAY:", text)
 
-    # 1) First try: normal JSON
+    # **FIX: Capture IMMEDIATELY after parsing**
     try:
         body = json.loads(text)
-        print("PARSED BODY:", body)  # ← DEBUG: see parsed input
+        print("PARSED BODY:", body)
+
+        # **MOVE THIS UP - capture before anything modifies body**
+        final_body = body.copy()  # Safe copy
+        if "properties" in final_body:
+            print("FOUND PROPERTIES WRAPPER:", final_body["properties"])
+            final_body = final_body["properties"]
+
+        print("FINAL BODY FOR Pydantic:", final_body)
+
     except json.JSONDecodeError:
-        # 2) Fallback: handle non-JSON format
+        # Fallback parsing...
         data = {}
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("{") or line.startswith("}"):
-                continue
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip().rstrip(",")
+        # ... existing fallback code ...
+        final_body = data
 
-            if key in ("lead_time_days", "current_inventory_units"):
-                data[key] = int(value)
-            elif key == "safety_factor":
-                data[key] = float(value)
-            elif key == "item":
-                data[key] = value
-
-        body = data
-
-    # **Handle properties wrapper**
-    if "properties" in body:
-        print("FOUND PROPERTIES WRAPPER:", body["properties"])
-        body = body["properties"]
-    
-    print("FINAL BODY FOR Pydantic:", body)  # ← DEBUG: final input
-
-    # Validate
+    # Use the captured final_body
     try:
-        req = InventoryRequest(**body)
-        print("SUCCESSFUL Pydantic parse:", req.dict())  # ← DEBUG: final req
+        req = InventoryRequest(**final_body)
+        print("SUCCESSFUL Pydantic parse:", req.dict())
     except Exception as e:
         print("PYDANTIC ERROR:", str(e))
         raise HTTPException(status_code=400, detail=f"Request body does not match: {str(e)}")
