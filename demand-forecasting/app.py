@@ -153,36 +153,48 @@ def inventory_plan(req: InventoryRequest):
 async def inventory_plan_root_proxy(request: Request):
     raw_body = await request.body()
     text = raw_body.decode("utf-8")
-    print("RAW BODY FROM GATEWAY:", text)
+    print("=== RAW BODY FROM GATEWAY ===")
+    print(repr(text))
+    print("=== END RAW BODY ===")
+
+    # **FIX: Repair common JSON errors (unquoted strings)**
+    text = text.replace('"item": jeans', '"item": "jeans"')
+    text = text.replace('"item": shirt', '"item": "shirt"')
+    print("=== REPAIRED JSON ===")
+    print(repr(text))
 
     try:
         body = json.loads(text)
         print("PARSED BODY:", body)
 
-        # **FIX 1: Handle Workato's stringified body**
-        if isinstance(body.get("body"), str):
-            print("Workato stringified body detected")
-            body = json.loads(body["body"])
-            print("EXTRACTED JSON BODY:", body)
-
-        # **FIX 2: Handle properties wrapper**
-        final_body = body.copy()
-        if "properties" in final_body:
-            print("FOUND PROPERTIES WRAPPER:", final_body["properties"])
-            final_body = final_body["properties"]
+        # Handle direct JSON payload (most common now)
+        if isinstance(body, dict) and "lead_time_days" in body:
+            print("Direct JSON payload detected")
+            final_body = body
+        else:
+            final_body = body
 
         print("FINAL BODY FOR Pydantic:", final_body)
 
     except json.JSONDecodeError as e:
         print("JSON PARSE ERROR:", str(e))
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        raise HTTPException(status_code=400, detail="Invalid JSON body - check quotes around item name")
 
-    # **FIX 3: NO DEFAULTS - fail if required fields missing**
+    # Validate required fields
+    missing = []
+    if "lead_time_days" not in final_body:
+        missing.append("lead_time_days")
+    if "current_inventory_units" not in final_body:
+        missing.append("current_inventory_units")
+
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}")
+
     try:
         req = InventoryRequest(**final_body)
         print("SUCCESSFUL Pydantic parse:", req.dict())
     except Exception as e:
         print("PYDANTIC ERROR:", str(e))
-        raise HTTPException(status_code=400, detail=f"Missing required fields: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Validation error: {str(e)}")
 
     return inventory_plan(req)
