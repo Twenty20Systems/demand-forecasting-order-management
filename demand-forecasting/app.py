@@ -6,7 +6,6 @@ from pydantic import BaseModel
 from chronos import BaseChronosPipeline
 from typing import Optional, List
 
-
 app = FastAPI(
     title="Fashion Inventory Planner",
     description="Chronos-based demand forecasting for shirts and jeans",
@@ -23,8 +22,8 @@ df["Date Purchase"] = pd.to_datetime(df["Date Purchase"])
 # Daily total units across all items
 daily_units = (
     df.groupby("Date Purchase")["Purchased Quantity"]
-      .sum()
-      .sort_index()
+     .sum()
+     .sort_index()
 )
 
 # Daily units per item (e.g. "shirt", "jeans")
@@ -48,21 +47,19 @@ pipeline = BaseChronosPipeline.from_pretrained(
 )
 
 # -----------------------------
-# Pydantic models
+# Pydantic models - NO MISLEADING DEFAULTS
 # -----------------------------
 
 class InventoryRequest(BaseModel):
-    lead_time_days: int = 7
-    current_inventory_units: int = 0
+    lead_time_days: int           # REQUIRED
+    current_inventory_units: int  # REQUIRED
     safety_factor: float = 1.2
-    item: Optional[str] = None  # "shirt", "jeans", or None for all
-
+    item: Optional[str] = None
 
 class DailyForecast(BaseModel):
     date: str
     forecast_units: int
     risk_of_stockout: str
-
 
 class InventoryResponse(BaseModel):
     item: str
@@ -149,7 +146,7 @@ def inventory_plan(req: InventoryRequest):
     )
 
 # -----------------------------
-# Root proxy for API Gateway
+# Root proxy for API Gateway - FIXED FOR WORKATO
 # -----------------------------
 
 @app.post("/", response_model=InventoryResponse)
@@ -158,31 +155,34 @@ async def inventory_plan_root_proxy(request: Request):
     text = raw_body.decode("utf-8")
     print("RAW BODY FROM GATEWAY:", text)
 
-    # **FIX: Capture IMMEDIATELY after parsing**
     try:
         body = json.loads(text)
         print("PARSED BODY:", body)
 
-        # **MOVE THIS UP - capture before anything modifies body**
-        final_body = body.copy()  # Safe copy
+        # **FIX 1: Handle Workato's stringified body**
+        if isinstance(body.get("body"), str):
+            print("Workato stringified body detected")
+            body = json.loads(body["body"])
+            print("EXTRACTED JSON BODY:", body)
+
+        # **FIX 2: Handle properties wrapper**
+        final_body = body.copy()
         if "properties" in final_body:
             print("FOUND PROPERTIES WRAPPER:", final_body["properties"])
             final_body = final_body["properties"]
 
         print("FINAL BODY FOR Pydantic:", final_body)
 
-    except json.JSONDecodeError:
-        # Fallback parsing...
-        data = {}
-        # ... existing fallback code ...
-        final_body = data
+    except json.JSONDecodeError as e:
+        print("JSON PARSE ERROR:", str(e))
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    # Use the captured final_body
+    # **FIX 3: NO DEFAULTS - fail if required fields missing**
     try:
         req = InventoryRequest(**final_body)
         print("SUCCESSFUL Pydantic parse:", req.dict())
     except Exception as e:
         print("PYDANTIC ERROR:", str(e))
-        raise HTTPException(status_code=400, detail=f"Request body does not match: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Missing required fields: {str(e)}")
 
     return inventory_plan(req)
