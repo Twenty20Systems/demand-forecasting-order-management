@@ -158,7 +158,7 @@ async def inventory_plan_root_proxy(request: Request):
     text = raw_body.decode("utf-8")
     print("RAW BODY FROM GATEWAY:", raw_body)
 
-    # 1) First try: normal JSON (preferred, original behavior)
+    # 1) First try: normal JSON (preferred)
     try:
         body = json.loads(text)
     except json.JSONDecodeError:
@@ -180,11 +180,15 @@ async def inventory_plan_root_proxy(request: Request):
             elif key == "safety_factor":
                 data[key] = float(value)
             elif key == "item":
-                data[key] = value  # e.g. shirt, jeans
+                data[key] = value
 
         body = data
 
-    # Now `body` should match InventoryRequest
+    # **NEW: Handle properties wrapper from Workato**
+    if "properties" in body:
+        body = body["properties"]
+
+    # Validate and process
     try:
         req = InventoryRequest(**body)
     except Exception:
