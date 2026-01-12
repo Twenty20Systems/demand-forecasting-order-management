@@ -211,14 +211,29 @@ async def inventory_plan_root_proxy(request: Request):
     print(repr(text))
     print("=== END RAW BODY ===")
 
-    # **FIX: Repair common JSON errors (unquoted strings)**
-    text = text.replace('"item": jeans', '"item": "jeans"')
-    text = text.replace('"item": shirt', '"item": "shirt"')
-    text = text.replace('"region": East Coast', '"region": "East Coast"')
-    text = text.replace('"region": West Coast', '"region": "West Coast"')
+    # **FIX: Repair common JSON errors (unquoted strings, missing commas)**
+    import re
+
+    # Step 1: Fix unquoted item values (jeans or shirt)
+    # Pattern: "item": jeans (with optional whitespace, followed by newline, comma, or closing brace)
+    text = re.sub(r'"item"\s*:\s*(jeans|shirt)(\s*)([,\n}])', r'"item": "\1"\2\3', text, flags=re.IGNORECASE)
+
+    # Step 2: Fix unquoted region values (East Coast or West Coast)
+    # Pattern: "region":West Coast or "region": East Coast
+    text = re.sub(r'"region"\s*:\s*(East Coast|West Coast)(\s*)([,\n}])', r'"region": "\1"\2\3', text)
+
+    # Step 3: Fix missing comma after item value when followed by region on new line
+    # Pattern: "item": "jeans"\n  "region" -> "item": "jeans",\n  "region"
+    text = re.sub(r'"item"\s*:\s*"([^"]+)"\s*\n\s*"region"', r'"item": "\1",\n  "region"', text)
+
+    # Step 4: Fix missing comma after unquoted item value when followed by region on new line
+    # Pattern: "item": jeans\n  "region" -> "item": "jeans",\n  "region"
+    text = re.sub(r'"item"\s*:\s*(jeans|shirt)\s*\n\s*"region"', r'"item": "\1",\n  "region"', text, flags=re.IGNORECASE)
+
     print("=== REPAIRED JSON ===")
     print(repr(text))
 
+    # Try parsing, with fallback repair if needed
     try:
         body = json.loads(text)
         print("PARSED BODY:", body)
@@ -233,8 +248,28 @@ async def inventory_plan_root_proxy(request: Request):
         print("FINAL BODY FOR Pydantic:", final_body)
 
     except json.JSONDecodeError as e:
-        print("JSON PARSE ERROR:", str(e))
-        raise HTTPException(status_code=400, detail="Invalid JSON body - check quotes around item name")
+        print("JSON PARSE ERROR (first attempt):", str(e))
+        # Fallback: More aggressive repair for common patterns
+        # Fix missing comma: value followed by newline and key (most common case)
+        # Pattern: "key": value\n  "nextkey" -> "key": "value",\n  "nextkey"
+        text = re.sub(r':\s*([^",}\[\n\]]+?)\s*\n\s*"([a-z_]+)"\s*:', r': "\1",\n  "\2":', text)
+
+        # Fix missing comma: quoted value followed by newline and key
+        text = re.sub(r':\s*"([^"]+)"\s*\n\s*"([a-z_]+)"\s*:', r': "\1",\n  "\2":', text)
+
+        # Fix any remaining unquoted item/region values
+        text = re.sub(r'"item"\s*:\s*(jeans|shirt)(\s*)([,\n}])', r'"item": "\1"\2\3', text, flags=re.IGNORECASE)
+        text = re.sub(r'"region"\s*:\s*(East Coast|West Coast)(\s*)([,\n}])', r'"region": "\1"\2\3', text)
+
+        print("=== FALLBACK REPAIRED JSON ===")
+        print(repr(text))
+
+        try:
+            body = json.loads(text)
+            print("SUCCESS after fallback repair")
+        except json.JSONDecodeError as e2:
+            print("JSON PARSE ERROR (after fallback):", str(e2))
+            raise HTTPException(status_code=400, detail=f"Invalid JSON body - check quotes around item/region names and commas between fields. Error: {str(e2)}")
 
     # Validate required fields
     missing = []
