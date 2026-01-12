@@ -19,14 +19,14 @@ app = FastAPI(
 df = pd.read_csv("data/Fashion_Retail_Sales.csv")
 df["Date Purchase"] = pd.to_datetime(df["Date Purchase"])
 
-# Daily total units across all items
+# Daily total units across all items (all regions)
 daily_units = (
     df.groupby("Date Purchase")["Purchased Quantity"]
      .sum()
      .sort_index()
 )
 
-# Daily units per item (e.g. "shirt", "jeans")
+# Daily units per item (e.g. "shirt", "jeans") - all regions
 item_series: dict[str, pd.Series] = {}
 for item_name, g in df.groupby("Item Purchased"):
     s = (
@@ -35,6 +35,26 @@ for item_name, g in df.groupby("Item Purchased"):
          .sort_index()
     )
     item_series[item_name] = s
+
+# Daily units per region (all items)
+region_series: dict[str, pd.Series] = {}
+for region_name, g in df.groupby("Region"):
+    s = (
+        g.groupby("Date Purchase")["Purchased Quantity"]
+         .sum()
+         .sort_index()
+    )
+    region_series[region_name] = s
+
+# Daily units per item per region
+item_region_series: dict[tuple[str, str], pd.Series] = {}
+for (item_name, region_name), g in df.groupby(["Item Purchased", "Region"]):
+    s = (
+        g.groupby("Date Purchase")["Purchased Quantity"]
+         .sum()
+         .sort_index()
+    )
+    item_region_series[(item_name, region_name)] = s
 
 # -----------------------------
 # Load Chronos model
@@ -55,6 +75,7 @@ class InventoryRequest(BaseModel):
     current_inventory_units: int  # REQUIRED
     safety_factor: float = 1.2
     item: Optional[str] = None
+    region: Optional[str] = None  # "East Coast" or "West Coast"
 
 class DailyForecast(BaseModel):
     date: str
@@ -63,6 +84,7 @@ class DailyForecast(BaseModel):
 
 class InventoryResponse(BaseModel):
     item: str
+    region: Optional[str] = None
     lead_time_days: int
     reorder_point_units: int
     suggested_order_units: int
@@ -74,15 +96,46 @@ class InventoryResponse(BaseModel):
 
 @app.post("/inventory-plan", response_model=InventoryResponse)
 def inventory_plan(req: InventoryRequest):
-    # Choose which time series to forecast
-    if req.item:
+    # Validate region if provided
+    if req.region:
+        valid_regions = ["East Coast", "West Coast"]
+        if req.region not in valid_regions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid region: {req.region}. Must be one of: {', '.join(valid_regions)}"
+            )
+
+    # Choose which time series to forecast based on item and region
+    if req.item and req.region:
+        # Specific item in specific region
+        key = (req.item, req.region)
+        if key not in item_region_series:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No data found for item '{req.item}' in region '{req.region}'"
+            )
+        series = item_region_series[key]
+        item_name = req.item
+        region_name = req.region
+    elif req.item:
+        # Specific item across all regions
         if req.item not in item_series:
             raise HTTPException(status_code=400, detail=f"Unknown item: {req.item}")
         series = item_series[req.item]
         item_name = req.item
+        region_name = None
+    elif req.region:
+        # All items in specific region
+        if req.region not in region_series:
+            raise HTTPException(status_code=400, detail=f"Unknown region: {req.region}")
+        series = region_series[req.region]
+        item_name = "All Items"
+        region_name = req.region
     else:
+        # All items across all regions
         series = daily_units
         item_name = "All Items"
+        region_name = None
 
     if len(series) < 3:
         raise HTTPException(status_code=400, detail="Not enough history to forecast")
@@ -139,6 +192,7 @@ def inventory_plan(req: InventoryRequest):
 
     return InventoryResponse(
         item=item_name,
+        region=region_name,
         lead_time_days=req.lead_time_days,
         reorder_point_units=reorder_point_units,
         suggested_order_units=suggested_order_units,
@@ -160,6 +214,8 @@ async def inventory_plan_root_proxy(request: Request):
     # **FIX: Repair common JSON errors (unquoted strings)**
     text = text.replace('"item": jeans', '"item": "jeans"')
     text = text.replace('"item": shirt', '"item": "shirt"')
+    text = text.replace('"region": East Coast', '"region": "East Coast"')
+    text = text.replace('"region": West Coast', '"region": "West Coast"')
     print("=== REPAIRED JSON ===")
     print(repr(text))
 
